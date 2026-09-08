@@ -2,6 +2,7 @@ import React, { useState, useEffect, useMemo } from 'react';
 import { QuoteItem, EvaluatedQuote, FilterState } from './types';
 import { DEFAULT_QUOTES } from './data/defaultQuotes';
 import { evaluateQuotes, getPRGroups, sortEvaluatedQuotes, exportQuotesToCSV } from './utils/evaluator';
+import { supabase, isSupabaseConfigured } from './lib/supabase';
 import { Navbar } from './components/Navbar';
 import { DashboardCards } from './components/DashboardCards';
 import { FilterBar } from './components/FilterBar';
@@ -10,13 +11,18 @@ import { PRGroupView } from './components/PRGroupView';
 import { PRDetailModal } from './components/PRDetailModal';
 import { QuoteFormModal } from './components/QuoteFormModal';
 import { ImportModal } from './components/ImportModal';
-
-const STORAGE_KEY = 'exs02.quotes.v1';
+import { LoginModal } from './components/LoginModal';
 
 export default function App() {
+  const [userEmail, setUserEmail] = useState<string | null>(() => {
+    // Check if demo bypass was active or session exists
+    return localStorage.getItem('exs02.user_email') || (!isSupabaseConfigured ? 'demo@purchasing.system' : null);
+  });
+  const [isLoadingQuotes, setIsLoadingQuotes] = useState(false);
+
   const [quotes, setQuotes] = useState<QuoteItem[]>(() => {
     try {
-      const saved = localStorage.getItem(STORAGE_KEY);
+      const saved = localStorage.getItem('exs02.quotes.v1');
       if (saved) {
         const parsed = JSON.parse(saved);
         if (Array.isArray(parsed) && parsed.length > 0) {
@@ -24,7 +30,7 @@ export default function App() {
         }
       }
     } catch (e) {
-      console.error('Failed to load from LocalStorage', e);
+      console.error('Failed to load local quotes', e);
     }
     return DEFAULT_QUOTES;
   });
@@ -42,14 +48,99 @@ export default function App() {
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
   const [isImportModalOpen, setIsImportModalOpen] = useState(false);
 
-  // Save to LocalStorage immediately on change
+  // Check Supabase Auth session on mount
   useEffect(() => {
-    try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(quotes));
-    } catch (e) {
-      console.error('Failed to save to LocalStorage', e);
+    if (!isSupabaseConfigured) return;
+
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      if (session?.user?.email) {
+        setUserEmail(session.user.email);
+        localStorage.setItem('exs02.user_email', session.user.email);
+      }
+    });
+
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+      if (session?.user?.email) {
+        setUserEmail(session.user.email);
+        localStorage.setItem('exs02.user_email', session.user.email);
+      } else {
+        setUserEmail(null);
+        localStorage.removeItem('exs02.user_email');
+      }
+    });
+
+    return () => {
+      subscription.unsubscribe();
+    };
+  }, []);
+
+  // Fetch quotes from Supabase if configured & logged in
+  useEffect(() => {
+    async function fetchSupabaseQuotes() {
+      if (!isSupabaseConfigured || !userEmail) return;
+
+      setIsLoadingQuotes(true);
+      try {
+        const { data, error } = await supabase.from('quotes').select('*');
+        if (error) {
+          console.error('Error fetching quotes from Supabase:', error);
+          return;
+        }
+
+        if (data && data.length > 0) {
+          const mapped: QuoteItem[] = data.map((d: any) => ({
+            quote_id: d.quote_id,
+            pr_no: d.pr_no,
+            item_code: d.item_code,
+            item_name: d.item_name,
+            supplier: d.supplier,
+            unit: d.unit,
+            qty: Number(d.qty),
+            unit_price: d.unit_price !== null && d.unit_price !== undefined ? Number(d.unit_price) : null,
+            currency: d.currency || 'KRW',
+            quote_date: d.quote_date,
+            required_date: d.required_date,
+            promised_date: d.promised_date || null,
+            status: d.status || '견적',
+            remark: d.remark || '',
+          }));
+          setQuotes(mapped);
+          localStorage.setItem('exs02.quotes.v1', JSON.stringify(mapped));
+        } else {
+          // If table is empty, seed default quotes into Supabase
+          const seedPayload = DEFAULT_QUOTES.map(q => ({
+            quote_id: q.quote_id,
+            pr_no: q.pr_no,
+            item_code: q.item_code,
+            item_name: q.item_name,
+            supplier: q.supplier,
+            unit: q.unit,
+            qty: q.qty,
+            unit_price: q.unit_price,
+            currency: q.currency,
+            quote_date: q.quote_date,
+            required_date: q.required_date,
+            promised_date: q.promised_date,
+            status: q.status,
+            remark: q.remark,
+          }));
+          await supabase.from('quotes').insert(seedPayload);
+        }
+      } catch (err) {
+        console.error('Supabase sync error:', err);
+      } finally {
+        setIsLoadingQuotes(false);
+      }
     }
-  }, [quotes]);
+
+    fetchSupabaseQuotes();
+  }, [userEmail]);
+
+  // Save changes locally and sync with Supabase
+  const persistQuotes = async (newQuotes: QuoteItem[]) => {
+    setQuotes(newQuotes);
+    localStorage.setItem('exs02.quotes.v1', JSON.stringify(newQuotes));
+  };
 
   // Evaluated quotes
   const evaluatedQuotes = useMemo(() => {
@@ -60,7 +151,6 @@ export default function App() {
   const filteredQuotes = useMemo(() => {
     let result = evaluatedQuotes;
 
-    // Search query
     if (filter.searchQuery.trim()) {
       const q = filter.searchQuery.toLowerCase();
       result = result.filter(
@@ -73,17 +163,14 @@ export default function App() {
       );
     }
 
-    // Status filter
     if (filter.statusFilter !== 'all') {
       result = result.filter(item => item.status === filter.statusFilter);
     }
 
-    // Delivery filter
     if (filter.deliveryFilter !== 'all') {
       result = result.filter(item => item.deliveryState === filter.deliveryFilter);
     }
 
-    // Warning filter from dashboard cards
     if (filter.warningFilter !== 'all') {
       if (filter.warningFilter === '이상치') {
         result = result.filter(item => item.priceState === '이상치');
@@ -102,7 +189,6 @@ export default function App() {
   }, [evaluatedQuotes, filter]);
 
   const prGroups = useMemo(() => {
-    // Apply search and status filters to groups as well
     let qList = evaluatedQuotes;
     if (filter.searchQuery.trim()) {
       const q = filter.searchQuery.toLowerCase();
@@ -124,39 +210,88 @@ export default function App() {
   const outlierCount = evaluatedQuotes.filter(q => q.priceState === '이상치').length;
 
   // Handlers
-  const handleToggleStatus = (quoteId: string) => {
-    setQuotes(prev =>
-      prev.map(q => {
-        if (q.quote_id === quoteId) {
-          return { ...q, status: q.status === '발주' ? '견적' : '발주' };
-        }
-        return q;
-      })
-    );
-  };
+  const handleToggleStatus = async (quoteId: string) => {
+    const updated = quotes.map(q => {
+      if (q.quote_id === quoteId) {
+        return { ...q, status: (q.status === '발주' ? '견적' : '발주') as '견적' | '발주' };
+      }
+      return q;
+    });
+    await persistQuotes(updated);
 
-  const handleDeleteQuote = (quoteId: string) => {
-    if (window.confirm(`견적 ${quoteId} 건을 삭제하시겠습니까?`)) {
-      setQuotes(prev => prev.filter(q => q.quote_id !== quoteId));
+    if (isSupabaseConfigured) {
+      const target = updated.find(q => q.quote_id === quoteId);
+      if (target) {
+        await supabase.from('quotes').update({ status: target.status }).eq('quote_id', quoteId);
+      }
     }
   };
 
-  const handleSaveQuote = (saved: QuoteItem) => {
-    setQuotes(prev => {
-      const exists = prev.some(q => q.quote_id === saved.quote_id);
-      if (exists) {
-        return prev.map(q => (q.quote_id === saved.quote_id ? saved : q));
+  const handleDeleteQuote = async (quoteId: string) => {
+    if (window.confirm(`견적 ${quoteId} 건을 삭제하시겠습니까?`)) {
+      const updated = quotes.filter(q => q.quote_id !== quoteId);
+      await persistQuotes(updated);
+
+      if (isSupabaseConfigured) {
+        await supabase.from('quotes').delete().eq('quote_id', quoteId);
       }
-      return [saved, ...prev];
-    });
+    }
+  };
+
+  const handleSaveQuote = async (saved: QuoteItem) => {
+    const exists = quotes.some(q => q.quote_id === saved.quote_id);
+    let updated: QuoteItem[];
+    if (exists) {
+      updated = quotes.map(q => (q.quote_id === saved.quote_id ? saved : q));
+    } else {
+      updated = [saved, ...quotes];
+    }
+    await persistQuotes(updated);
+
+    if (isSupabaseConfigured) {
+      await supabase.from('quotes').upsert([saved], { onConflict: 'quote_id' });
+    }
+
     setEditingQuote(null);
     setIsAddModalOpen(false);
   };
 
-  const handleResetDefault = () => {
-    if (window.confirm('기본 샘플 데이터(80행)로 초기화하시겠습니까? (작업 중인 내용이 초기화됩니다)')) {
-      setQuotes(DEFAULT_QUOTES);
-      localStorage.removeItem(STORAGE_KEY);
+  const handleImportQuotes = async (imported: QuoteItem[]) => {
+    await persistQuotes(imported);
+    setIsImportModalOpen(false);
+
+    if (isSupabaseConfigured) {
+      // Upsert imported quotes into Supabase to accumulate data
+      const payload = imported.map(q => ({
+        quote_id: q.quote_id,
+        pr_no: q.pr_no,
+        item_code: q.item_code,
+        item_name: q.item_name,
+        supplier: q.supplier,
+        unit: q.unit,
+        qty: q.qty,
+        unit_price: q.unit_price,
+        currency: q.currency,
+        quote_date: q.quote_date,
+        required_date: q.required_date,
+        promised_date: q.promised_date,
+        status: q.status,
+        remark: q.remark,
+      }));
+      const { error } = await supabase.from('quotes').upsert(payload, { onConflict: 'quote_id' });
+      if (error) {
+        console.error('Supabase import error:', error);
+        alert('Supabase DB 누적 저장 중 오류가 발생했습니다: ' + error.message);
+      } else {
+        alert('성공적으로 CSV 데이터가 Supabase DB에 누적 저장되었습니다.');
+      }
+    }
+  };
+
+  const handleResetDefault = async () => {
+    if (window.confirm('기본 샘플 데이터(80행)로 초기화하시겠습니까?')) {
+      await persistQuotes(DEFAULT_QUOTES);
+      localStorage.removeItem('exs02.quotes.v1');
     }
   };
 
@@ -166,10 +301,34 @@ export default function App() {
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
-    link.download = `purchase_quotes_export_${new Date().toISOString().slice(0, 10)}.csv`;
+    link.download = `purchase_quotes_supabase_${new Date().toISOString().slice(0, 10)}.csv`;
     link.click();
     URL.revokeObjectURL(url);
   };
+
+  const handleLogout = async () => {
+    if (isSupabaseConfigured) {
+      await supabase.auth.signOut();
+    }
+    setUserEmail(null);
+    localStorage.removeItem('exs02.user_email');
+  };
+
+  // If user is not logged in, show Login Modal
+  if (!userEmail) {
+    return (
+      <LoginModal
+        onLoginSuccess={email => {
+          setUserEmail(email);
+          localStorage.setItem('exs02.user_email', email);
+        }}
+        onBypassDemo={() => {
+          setUserEmail('demo@purchasing.system');
+          localStorage.setItem('exs02.user_email', 'demo@purchasing.system');
+        }}
+      />
+    );
+  }
 
   return (
     <div className="min-h-screen bg-slate-100 flex flex-col font-sans text-slate-900">
@@ -178,6 +337,7 @@ export default function App() {
         orderCount={orderCount}
         delayCount={delayCount}
         outlierCount={outlierCount}
+        userEmail={userEmail}
         onOpenImport={() => setIsImportModalOpen(true)}
         onOpenAdd={() => {
           setEditingQuote(null);
@@ -185,9 +345,16 @@ export default function App() {
         }}
         onResetDefault={handleResetDefault}
         onExportCSV={handleExportCSV}
+        onLogout={handleLogout}
       />
 
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6">
+        {isLoadingQuotes && (
+          <div className="bg-blue-50 border border-blue-200 p-3 rounded-xl mb-4 text-xs text-blue-800 text-center">
+            Supabase DB에서 견적 데이터를 동기화하고 있습니다...
+          </div>
+        )}
+
         {/* Warning Summary Dashboard */}
         <DashboardCards quotes={evaluatedQuotes} filter={filter} setFilter={setFilter} />
 
@@ -251,10 +418,7 @@ export default function App() {
       {/* Import Modal */}
       {isImportModalOpen && (
         <ImportModal
-          onImport={imported => {
-            setQuotes(imported);
-            setIsImportModalOpen(false);
-          }}
+          onImport={handleImportQuotes}
           onClose={() => setIsImportModalOpen(false)}
         />
       )}
