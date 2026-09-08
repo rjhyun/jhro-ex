@@ -2,7 +2,7 @@ import React, { useState, useEffect, useMemo } from 'react';
 import { QuoteItem, EvaluatedQuote, FilterState } from './types';
 import { DEFAULT_QUOTES } from './data/defaultQuotes';
 import { evaluateQuotes, getPRGroups, sortEvaluatedQuotes, exportQuotesToCSV } from './utils/evaluator';
-import { supabase, isSupabaseConfigured } from './lib/supabase';
+import { getSupabaseClient, isSupabaseConfigured } from './lib/supabase';
 import { Navbar } from './components/Navbar';
 import { DashboardCards } from './components/DashboardCards';
 import { FilterBar } from './components/FilterBar';
@@ -15,8 +15,7 @@ import { LoginModal } from './components/LoginModal';
 
 export default function App() {
   const [userEmail, setUserEmail] = useState<string | null>(() => {
-    // Check if demo bypass was active or session exists
-    return localStorage.getItem('exs02.user_email') || (!isSupabaseConfigured ? 'demo@purchasing.system' : null);
+    return localStorage.getItem('exs02.user_email') || (!isSupabaseConfigured() ? 'demo@purchasing.system' : null);
   });
   const [isLoadingQuotes, setIsLoadingQuotes] = useState(false);
 
@@ -50,16 +49,17 @@ export default function App() {
 
   // Check Supabase Auth session on mount
   useEffect(() => {
-    if (!isSupabaseConfigured) return;
+    if (!isSupabaseConfigured()) return;
 
-    supabase.auth.getSession().then(({ data: { session } }) => {
+    const client = getSupabaseClient();
+    client.auth.getSession().then(({ data: { session } }) => {
       if (session?.user?.email) {
         setUserEmail(session.user.email);
         localStorage.setItem('exs02.user_email', session.user.email);
       }
     });
 
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+    const { data: { subscription } } = client.auth.onAuthStateChange((_event, session) => {
       if (session?.user?.email) {
         setUserEmail(session.user.email);
         localStorage.setItem('exs02.user_email', session.user.email);
@@ -72,16 +72,17 @@ export default function App() {
     return () => {
       subscription.unsubscribe();
     };
-  }, []);
+  }, [userEmail]);
 
   // Fetch quotes from Supabase if configured & logged in
   useEffect(() => {
     async function fetchSupabaseQuotes() {
-      if (!isSupabaseConfigured || !userEmail) return;
+      if (!isSupabaseConfigured() || !userEmail || userEmail === 'demo@purchasing.system') return;
 
       setIsLoadingQuotes(true);
       try {
-        const { data, error } = await supabase.from('quotes').select('*');
+        const client = getSupabaseClient();
+        const { data, error } = await client.from('quotes').select('*');
         if (error) {
           console.error('Error fetching quotes from Supabase:', error);
           return;
@@ -107,7 +108,6 @@ export default function App() {
           setQuotes(mapped);
           localStorage.setItem('exs02.quotes.v1', JSON.stringify(mapped));
         } else {
-          // If table is empty, seed default quotes into Supabase
           const seedPayload = DEFAULT_QUOTES.map(q => ({
             quote_id: q.quote_id,
             pr_no: q.pr_no,
@@ -124,7 +124,7 @@ export default function App() {
             status: q.status,
             remark: q.remark,
           }));
-          await supabase.from('quotes').insert(seedPayload);
+          await client.from('quotes').insert(seedPayload);
         }
       } catch (err) {
         console.error('Supabase sync error:', err);
@@ -136,18 +136,15 @@ export default function App() {
     fetchSupabaseQuotes();
   }, [userEmail]);
 
-  // Save changes locally and sync with Supabase
   const persistQuotes = async (newQuotes: QuoteItem[]) => {
     setQuotes(newQuotes);
     localStorage.setItem('exs02.quotes.v1', JSON.stringify(newQuotes));
   };
 
-  // Evaluated quotes
   const evaluatedQuotes = useMemo(() => {
     return evaluateQuotes(quotes);
   }, [quotes]);
 
-  // Filter & sort
   const filteredQuotes = useMemo(() => {
     let result = evaluatedQuotes;
 
@@ -203,13 +200,11 @@ export default function App() {
     return getPRGroups(qList);
   }, [evaluatedQuotes, filter.searchQuery]);
 
-  // Stats
   const totalCount = quotes.length;
   const orderCount = quotes.filter(q => q.status === '발주').length;
   const delayCount = evaluatedQuotes.filter(q => q.deliveryState === '지연').length;
   const outlierCount = evaluatedQuotes.filter(q => q.priceState === '이상치').length;
 
-  // Handlers
   const handleToggleStatus = async (quoteId: string) => {
     const updated = quotes.map(q => {
       if (q.quote_id === quoteId) {
@@ -219,10 +214,11 @@ export default function App() {
     });
     await persistQuotes(updated);
 
-    if (isSupabaseConfigured) {
+    if (isSupabaseConfigured() && userEmail !== 'demo@purchasing.system') {
       const target = updated.find(q => q.quote_id === quoteId);
       if (target) {
-        await supabase.from('quotes').update({ status: target.status }).eq('quote_id', quoteId);
+        const client = getSupabaseClient();
+        await client.from('quotes').update({ status: target.status }).eq('quote_id', quoteId);
       }
     }
   };
@@ -232,8 +228,9 @@ export default function App() {
       const updated = quotes.filter(q => q.quote_id !== quoteId);
       await persistQuotes(updated);
 
-      if (isSupabaseConfigured) {
-        await supabase.from('quotes').delete().eq('quote_id', quoteId);
+      if (isSupabaseConfigured() && userEmail !== 'demo@purchasing.system') {
+        const client = getSupabaseClient();
+        await client.from('quotes').delete().eq('quote_id', quoteId);
       }
     }
   };
@@ -248,8 +245,9 @@ export default function App() {
     }
     await persistQuotes(updated);
 
-    if (isSupabaseConfigured) {
-      await supabase.from('quotes').upsert([saved], { onConflict: 'quote_id' });
+    if (isSupabaseConfigured() && userEmail !== 'demo@purchasing.system') {
+      const client = getSupabaseClient();
+      await client.from('quotes').upsert([saved], { onConflict: 'quote_id' });
     }
 
     setEditingQuote(null);
@@ -260,8 +258,8 @@ export default function App() {
     await persistQuotes(imported);
     setIsImportModalOpen(false);
 
-    if (isSupabaseConfigured) {
-      // Upsert imported quotes into Supabase to accumulate data
+    if (isSupabaseConfigured() && userEmail !== 'demo@purchasing.system') {
+      const client = getSupabaseClient();
       const payload = imported.map(q => ({
         quote_id: q.quote_id,
         pr_no: q.pr_no,
@@ -278,7 +276,7 @@ export default function App() {
         status: q.status,
         remark: q.remark,
       }));
-      const { error } = await supabase.from('quotes').upsert(payload, { onConflict: 'quote_id' });
+      const { error } = await client.from('quotes').upsert(payload, { onConflict: 'quote_id' });
       if (error) {
         console.error('Supabase import error:', error);
         alert('Supabase DB 누적 저장 중 오류가 발생했습니다: ' + error.message);
@@ -307,14 +305,14 @@ export default function App() {
   };
 
   const handleLogout = async () => {
-    if (isSupabaseConfigured) {
-      await supabase.auth.signOut();
+    if (isSupabaseConfigured()) {
+      const client = getSupabaseClient();
+      await client.auth.signOut();
     }
     setUserEmail(null);
     localStorage.removeItem('exs02.user_email');
   };
 
-  // If user is not logged in, show Login Modal
   if (!userEmail) {
     return (
       <LoginModal
@@ -355,13 +353,10 @@ export default function App() {
           </div>
         )}
 
-        {/* Warning Summary Dashboard */}
         <DashboardCards quotes={evaluatedQuotes} filter={filter} setFilter={setFilter} />
 
-        {/* Filter and Search Bar */}
         <FilterBar filter={filter} setFilter={setFilter} totalFilteredCount={filteredQuotes.length} />
 
-        {/* Active Warning Filter Notification Banner */}
         {filter.warningFilter !== 'all' && (
           <div className="bg-blue-50 border border-blue-200 px-4 py-2.5 rounded-xl mb-4 flex items-center justify-between text-xs text-blue-900">
             <span>
@@ -376,7 +371,6 @@ export default function App() {
           </div>
         )}
 
-        {/* Main Content View */}
         {filter.viewMode === 'table' ? (
           <QuoteTable
             quotes={filteredQuotes}
@@ -393,7 +387,6 @@ export default function App() {
         )}
       </main>
 
-      {/* PR Detail Modal */}
       {selectedPRNo && (
         <PRDetailModal
           prNo={selectedPRNo}
@@ -403,7 +396,6 @@ export default function App() {
         />
       )}
 
-      {/* Add / Edit Modal */}
       {(isAddModalOpen || editingQuote) && (
         <QuoteFormModal
           quoteToEdit={editingQuote}
@@ -415,7 +407,6 @@ export default function App() {
         />
       )}
 
-      {/* Import Modal */}
       {isImportModalOpen && (
         <ImportModal
           onImport={handleImportQuotes}
